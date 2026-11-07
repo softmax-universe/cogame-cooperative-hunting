@@ -24,7 +24,7 @@
         "--port:8080"
       ],
       "env": {},
-      "source_url": "https://github.com/Metta-AI/cogame-cooperative-hunting/tree/main"
+      "source_url": "https://github.com/softmax-universe/cogame-cooperative-hunting/tree/main"
     },
     "replay_viewer": {
       "bundle": "static-replay-viewer"
@@ -395,7 +395,7 @@
       "env": {
         "PLAYER_PROMPT": "Commit to the biggest animal your visible party can actually take. Name the allies you need in \"with\" and take the side you name in \"side\"; do not switch targets while a ring is forming. Take a rabbit only when nobody is close enough to help. If your energy is under 30, rest until it is back over 60."
       },
-      "source_url": "https://github.com/Metta-AI/cogame-cooperative-hunting/tree/main"
+      "source_url": "https://github.com/softmax-universe/cogame-cooperative-hunting/tree/main"
     },
     {
       "id": "big-game-hunter",
@@ -409,7 +409,7 @@
       "env": {
         "PLAYER_SCRIPTED": "big_game_hunter"
       },
-      "source_url": "https://github.com/Metta-AI/cogame-cooperative-hunting/tree/main"
+      "source_url": "https://github.com/softmax-universe/cogame-cooperative-hunting/tree/main"
     },
     {
       "id": "sidekick",
@@ -423,7 +423,7 @@
       "env": {
         "PLAYER_SCRIPTED": "sidekick"
       },
-      "source_url": "https://github.com/Metta-AI/cogame-cooperative-hunting/tree/main"
+      "source_url": "https://github.com/softmax-universe/cogame-cooperative-hunting/tree/main"
     },
     {
       "id": "modeler",
@@ -437,7 +437,7 @@
       "env": {
         "PLAYER_SCRIPTED": "modeler"
       },
-      "source_url": "https://github.com/Metta-AI/cogame-cooperative-hunting/tree/main"
+      "source_url": "https://github.com/softmax-universe/cogame-cooperative-hunting/tree/main"
     }
   ],
   "variants": [
