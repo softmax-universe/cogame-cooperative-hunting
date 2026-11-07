@@ -10,7 +10,7 @@ import sys
 
 SEATS = 6
 IMAGE = "{{COOPERATIVE_HUNTING_IMAGE}}"
-REPO = "https://github.com/Metta-AI/cogame-cooperative-hunting/tree/main"
+REPO = "https://github.com/softmax-universe/cogame-cooperative-hunting/tree/main"
 
 # Spectator-side display names, and deliberately NOT the in-game aliases.
 # A seat's alias (Cog-A .. Cog-F) is an independent seeded permutation drawn
