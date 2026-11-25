@@ -78,9 +78,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         number = len(self.server.calls)
         if self.server.mode == "normalized":
             action["intent"] = "INVALID"
-        malformed = self.server.mode == "malformed" and number == 0
-        status = 429 if self.server.mode == "429" else 200
-        text = "malformed: no JSON" if malformed else json.dumps(action)
+        malformed = (self.server.mode == "malformed" and number == 0) or (
+            self.server.mode == "malformed-fatal"
+        )
+        status = (
+            503
+            if self.server.mode == "503"
+            else 429
+            if self.server.mode == "429"
+            else 200
+        )
+        text = "malformed: no JSON secret-reply-body" if malformed else json.dumps(action)
         response = {
             "model": "local-fixture-no-teacher",
             "stop_reason": "end_turn",
@@ -89,6 +97,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         }
         if status == 429:
             response = {"error": {"message": "local fixture throttled"}}
+        elif status == 503:
+            response = {"error": {"message": "upstream provider secret 503 trace"}}
         encoded = json.dumps(response).encode()
         identity = str(uuid.uuid4())
         call = {
@@ -150,6 +160,7 @@ def run_case(args, name, mode, binary, expected_capture):
         COGAME_CONFIG_URI=(destination / "config.json").as_uri(),
         COGAME_RESULTS_URI=(destination / "results.json").as_uri(),
         COGAME_SAVE_REPLAY_URI=(destination / "replay.json").as_uri(),
+        COGAME_PLAYER_FAILURE_URI=(destination / "player_failure.json").as_uri(),
         COGAME_SAVE_TRAJECTORY_URI=(destination / "decisions.jsonl").as_uri(),
         COWORLD_EPISODE_ID="loopback-" + name,
         COWORLD_GAME_VERSION="local-capture-candidate",
@@ -211,15 +222,38 @@ def run_case(args, name, mode, binary, expected_capture):
                 )
             )
         code = game.wait(timeout=110)
-        if name in {"artifact-failure", "429-fallback", "no-credentials"}:
+        if name in {
+            "artifact-failure",
+            "429-fallback",
+            "503-unavailable",
+            "no-credentials",
+            "normalized-rejected",
+            "malformed-fatal",
+        }:
             assert code != 0, f"expected non-zero exit for {name}"
-            if name in {"429-fallback", "no-credentials"}:
+            if name != "artifact-failure":
                 assert not (destination / "results.json").exists(), (
                     f"{name} must not fabricate results.json"
                 )
                 assert not (destination / "replay.json").exists(), (
                     f"{name} must not fabricate replay.json"
                 )
+                failure_path = destination / "player_failure.json"
+                assert failure_path.exists(), f"{name} must write player_failure.json"
+                failure = json.loads(failure_path.read_text())
+                assert set(failure) == {"kind", "failed_policy_index", "message"}, (
+                    f"unexpected player_failure keys: {failure!r}"
+                )
+                expected_kind = (
+                    "player_error"
+                    if name in {"normalized-rejected", "malformed-fatal"}
+                    else "episode_inconclusive"
+                )
+                assert failure["kind"] == expected_kind, failure
+                assert failure["failed_policy_index"] == 0, failure
+                assert 1 <= len(failure["message"]) <= 240, failure
+                assert "secret" not in failure["message"].lower(), failure
+                assert "INVALID" not in failure["message"], failure
             rows = [
                 json.loads(line)
                 for line in (destination / "decisions.jsonl").read_text().splitlines()
@@ -233,14 +267,26 @@ def run_case(args, name, mode, binary, expected_capture):
                 assert fixture.calls and all(
                     item["status"] == 429 for item in fixture.calls
                 )
+            if name == "503-unavailable":
+                assert fixture.calls and all(
+                    item["status"] == 503 for item in fixture.calls
+                )
+            if name in {"normalized-rejected", "malformed-fatal"}:
+                assert len(fixture.calls) == 2
             return {
                 "case": name,
                 "capture": True,
                 "failure_retained": True,
+                "player_failure": (
+                    json.loads((destination / "player_failure.json").read_text())
+                    if (destination / "player_failure.json").exists()
+                    else None
+                ),
                 "teacher_authorized": False,
                 "family": rows[-1]["seed_family"],
             }
         assert code == 0, (destination / "game.log").read_text()
+        assert not (destination / "player_failure.json").exists()
         results = json.loads((destination / "results.json").read_text())
         replay = json.loads((destination / "replay.json").read_text())
         if name in {"no-players", "deadline"}:
@@ -413,8 +459,10 @@ def main():
         ("positive", "success", args.game, True),
         ("malformed-retry", "malformed", args.game, True),
         ("429-fallback", "429", args.game, True),
+        ("503-unavailable", "503", args.game, True),
         ("no-credentials", "no-credentials", args.game, True),
         ("normalized-rejected", "normalized", args.game, True),
+        ("malformed-fatal", "malformed-fatal", args.game, True),
     ]
     cases.extend(
         [
