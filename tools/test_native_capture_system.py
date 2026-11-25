@@ -211,8 +211,15 @@ def run_case(args, name, mode, binary, expected_capture):
                 )
             )
         code = game.wait(timeout=110)
-        if name == "artifact-failure":
-            assert code != 0
+        if name in {"artifact-failure", "429-fallback", "no-credentials"}:
+            assert code != 0, f"expected non-zero exit for {name}"
+            if name in {"429-fallback", "no-credentials"}:
+                assert not (destination / "results.json").exists(), (
+                    f"{name} must not fabricate results.json"
+                )
+                assert not (destination / "replay.json").exists(), (
+                    f"{name} must not fabricate replay.json"
+                )
             rows = [
                 json.loads(line)
                 for line in (destination / "decisions.jsonl").read_text().splitlines()
@@ -220,6 +227,12 @@ def run_case(args, name, mode, binary, expected_capture):
             assert (
                 rows[-1]["status"] == "failed" and rows[-1]["outcome"]["runtime_error"]
             )
+            if name == "no-credentials":
+                assert not fixture.calls
+            if name == "429-fallback":
+                assert fixture.calls and all(
+                    item["status"] == 429 for item in fixture.calls
+                )
             return {
                 "case": name,
                 "capture": True,
@@ -326,23 +339,21 @@ def run_case(args, name, mode, binary, expected_capture):
                 ]
                 == 1
             )
-            assert results["llm_requests"] == 0 and not results["fallbacks"][0]
+            assert results["llm_requests"] == 0 and not results["missed_turns"][0]
         elif mode in {"success", "malformed"}:
-            assert len(accepted) >= 20 and results["fallbacks"][0] == 0
+            assert len(accepted) >= 20 and results["missed_turns"][0] == 0
         elif mode == "normalized":
-            assert not accepted and any(
-                "normalized" in item["rejection_reason"] for item in attempts
+            assert not accepted and results["missed_turns"][0] > 0
+            assert all(row["fallback_origin"] is None for row in decisions)
+            assert any(
+                "invalid action" in (item["rejection_reason"] or "")
+                for item in attempts
             )
         else:
-            assert not accepted and results["fallbacks"][0] > 0
+            assert not accepted and results["missed_turns"][0] > 0
         if mode == "malformed":
             assert attempts[0]["rejection_reason"] and not attempts[0]["accepted"]
             assert len(decisions[0]["attempts"]) == 2 and len(calls) == 25
-        if mode == "429":
-            assert calls and all(item["status"] == 429 for item in calls.values())
-            assert len(calls) <= 28
-        if mode == "no-credentials":
-            assert not calls
         # The public replay does not include controls; retain it as outcome proof;
         # do not fabricate an acknowledgement or claim policy causality from scores.
         intervals = [row["execution"] for row in decisions if row["execution"]]

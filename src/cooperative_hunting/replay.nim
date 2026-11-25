@@ -35,7 +35,7 @@ const
 
   EventVocabulary* = [
     "round_start", "player_spawn", "prey_spawn", "catch", "mine", "pickup",
-    "forage", "tag", "trample", "moose_gut", "plan", "fallback", "deadline",
+    "forage", "tag", "trample", "moose_gut", "plan", "missed_turn", "deadline",
     "round_end", "episode_end"
   ]
 
@@ -138,9 +138,9 @@ proc feedLineFor*(name: string, payload: JsonNode): tuple[kind, text: string] =
       result = ("", "")
     else:
       result = ("say", payload{"alias"}.getStr() & ": " & say)
-  of "fallback":
+  of "missed_turn":
     result = ("fallback", payload{"alias"}.getStr() &
-      " fell back to " & payload{"baseline"}.getStr() & " \u2014 " &
+      " missed turn " & $payload{"turn"}.getInt() & " \u2014 " &
       payload{"cause"}.getStr())
   of "round_start":
     result = ("round", "ROUND " & $payload{"round"}.getInt() & " begins")

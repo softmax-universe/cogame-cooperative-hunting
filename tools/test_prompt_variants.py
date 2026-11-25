@@ -76,8 +76,6 @@ def play(variant, seed, wording, prompt_seed, normalized=False):
                 )
                 action = json.loads(proposal)
                 action.update(
-                    side="invalid",
-                    intent="invalid",
                     note=f"PRIVATE-SEAT-{seat}:" + "雪" * 220,
                     say="雪" * 140,
                 )
@@ -92,7 +90,6 @@ def play(variant, seed, wording, prompt_seed, normalized=False):
             assert accepted["kind"] == "accepted"
             if normalized:
                 action = accepted["action"]
-                assert action["side"] == "any" and action["intent"] == "hunt"
                 assert len(action["note"]) == 200 and len(action["say"]) == 120
             else:
                 assert accepted["action"] == json.loads(proposal)
@@ -143,4 +140,43 @@ for variant in ("staghunt", "coop-mining", "lbf", "predator-prey"):
             flush=True,
         )
         play(variant, seed, "mixed", 4, normalized=True)
-        print(variant, "full normalized-action game PASS", flush=True)
+        print(variant, "full rune-capped-text game PASS", flush=True)
+    # Invalid intent/side must be rejected rather than silently coerced.
+    for bad_field in ({"intent": "invalid"}, {"side": "invalid"}):
+        with subprocess.Popen(
+            [str(BRIDGE), str(ROOT / "coworld_manifest_template.json"), variant],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        ) as proc:
+            proc.stdin.write(
+                json.dumps(
+                    {
+                        "kind": "reset",
+                        "seed": "17",
+                        "players": 6,
+                        "promptVariant": "canonical",
+                        "promptSeed": 0,
+                        "split": "train",
+                    }
+                )
+                + "\n"
+            )
+            proc.stdin.flush()
+            obs = json.loads(proc.stdout.readline())
+            action = {"intent": "hunt", "target": "none", "side": "any"}
+            action.update(bad_field)
+            proc.stdin.write(
+                json.dumps(
+                    {
+                        "kind": "step",
+                        "decision_id": obs["decision_id"],
+                        "response": json.dumps(action),
+                    }
+                )
+                + "\n"
+            )
+            proc.stdin.flush()
+            proc.stdin.close()
+            assert proc.wait(timeout=30) != 0, f"expected rejection for {bad_field}"

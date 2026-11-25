@@ -384,8 +384,8 @@ block worstCaseFixtureIsReachable:
       (block:
         let kindsEmitted = [
           feedLineFor("plan", %*{"alias": "Cog-A", "say": "go north"}).kind,
-          feedLineFor("fallback", %*{"alias": "Cog-F",
-            "baseline": "big_game_hunter", "cause": "no_credentials"}).kind]
+          feedLineFor("missed_turn", %*{"alias": "Cog-F",
+            "turn": 1, "cause": "parse"}).kind]
         var good = true
         for line in fixture["feed"]:
           if line["kind"].getStr() notin kindsEmitted:

@@ -67,6 +67,9 @@ work_dir="$(mktemp -d "${TMPDIR:-/tmp}/${slug}-smoke.XXXXXX")"
 seats=0
 
 cleanup() {
+  if [ -n "${stub_pid:-}" ]; then
+    kill "${stub_pid}" >/dev/null 2>&1 || true
+  fi
   docker ps -aq --filter "name=${prefix}" | xargs -r docker rm -f >/dev/null 2>&1 || true
   docker network rm "${network}" >/dev/null 2>&1 || true
   rm -rf "${work_dir}"
@@ -191,16 +194,82 @@ chmod 777 "${work_dir}"
 docker network create "${network}" >/dev/null
 
 game_env=()
-if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+docker_host_args=()
+stub_pid=""
+if [ -n "${COWORLD_LLM_ENDPOINT:-}" ]; then
+  game_env+=(-e "COWORLD_LLM_ENDPOINT=${COWORLD_LLM_ENDPOINT}")
+  if [ -n "${COWORLD_LLM_MODEL:-}" ]; then
+    game_env+=(-e "COWORLD_LLM_MODEL=${COWORLD_LLM_MODEL}")
+  fi
+  echo "COWORLD_LLM_ENDPOINT present: forwarding to game container"
+elif [ -n "${ANTHROPIC_API_KEY:-}" ]; then
   game_env+=(-e "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}")
   echo "ANTHROPIC_API_KEY present: the LLM path will be exercised"
 else
-  echo "no ANTHROPIC_API_KEY: the game must complete on its scripted baselines"
+  # Start a local deterministic HTTP model stub so the published prompt player
+  # actually calls HTTP and applies returned plans against explicit baselines.
+  cat > "${work_dir}/llm_stub.py" <<'PY'
+import http.server, json, re, socketserver, sys
+from pathlib import Path
+
+port_file = Path(sys.argv[1])
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *_):
+        pass
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(length)
+        req = json.loads(body)
+        user = req["messages"][0]["content"]
+        m = re.search(r"^LEGAL TARGETS: (.*)$", user, re.MULTILINE)
+        targets = m.group(1).split(", ") if m else ["none"]
+        target = next((t for t in targets if t != "none"), "none")
+        plan = {
+            "intent": "hunt" if target != "none" else "rest",
+            "target": target,
+            "side": "any",
+            "with": [],
+            "say": f"targeting {target}",
+            "note": "deterministic smoke",
+        }
+        payload = json.dumps({
+            "model": "smoke-deterministic-stub",
+            "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": json.dumps(plan)}],
+            "usage": {"input_tokens": 50, "output_tokens": 20},
+        }).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+server = http.server.ThreadingHTTPServer(("0.0.0.0", 0), Handler)
+port_file.write_text(str(server.server_port))
+server.serve_forever()
+PY
+  python3 "${work_dir}/llm_stub.py" "${work_dir}/stub.port" &
+  stub_pid="$!"
+  for _ in $(seq 1 50); do
+    [ -s "${work_dir}/stub.port" ] && break
+    sleep 0.1
+  done
+  stub_port="$(cat "${work_dir}/stub.port")"
+  if [ "$(uname -s)" = "Linux" ]; then
+    docker_host_args+=(--add-host=host.docker.internal:host-gateway)
+  fi
+  game_env+=(
+    -e "COWORLD_LLM_ENDPOINT=http://host.docker.internal:${stub_port}"
+    -e "COWORLD_LLM_MODEL=smoke-deterministic-stub"
+  )
+  echo "local deterministic LLM stub listening on port ${stub_port}"
 fi
 
 echo "starting game container (${image} ${game_bin}) ..."
 docker run -d --name "${prefix}-game" \
   --network "${network}" --network-alias "${prefix}-game" \
+  ${docker_host_args[@]+"${docker_host_args[@]}"} \
   -e COGAME_HOST=0.0.0.0 \
   -e COGAME_PORT="${port}" \
   -e COGAME_CONFIG_URI=file:///coworld/config.json \
@@ -308,6 +377,11 @@ for key in ("names", "scores"):
 reason = results.get("reason") or results.get("end_reason")
 if reason is not None:
     print(f"episode end reason: {reason}")
+
+if results.get("llm_requests", 0) <= 0:
+    raise SystemExit(f"expected llm_requests > 0 for prompt seat, got {results.get('llm_requests')!r}")
+if "missed_turns" in results and results["missed_turns"][0] != 0:
+    raise SystemExit(f"expected 0 missed_turns for prompt seat 0, got {results['missed_turns']!r}")
 
 replay_path = work / "replay.json"
 if not replay_path.exists() or replay_path.stat().st_size == 0:

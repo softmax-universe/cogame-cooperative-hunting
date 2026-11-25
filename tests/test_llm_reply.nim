@@ -31,16 +31,30 @@ block cleanJson:
   check("note survives", plan.note == "pair with A")
   check("src is llm", plan.src == "llm")
 
-block trailingProse:
+block markdownFence:
   let plan = parseText(
-    """{"intent":"assist","target":"none","side":"N"} -- I will help Cog-A.""")
-  check("trailing prose is tolerated", plan.target == "none")
-  check("the intent survives trailing prose", plan.intent == "assist")
+    "```json\n{\"intent\":\"flee\",\"target\":\"none\"}\n```")
+  check("standard outer markdown json fence is accepted", plan.intent == "flee")
+  let bareFence = parseText(
+    "```\n{\"intent\":\"rest\",\"target\":\"none\"}\n```")
+  check("standard outer bare markdown fence is accepted", bareFence.intent == "rest")
 
-block leadingProse:
-  let plan = parseText(
-    "Here is my plan:\n```json\n{\"intent\":\"flee\",\"target\":\"none\"}\n```")
-  check("leading prose and a fence are tolerated", plan.intent == "flee")
+block proseRejected:
+  var trailingRaised = false
+  try:
+    discard parseText(
+      """{"intent":"assist","target":"none","side":"N"} -- I will help Cog-A.""")
+  except CatchableError:
+    trailingRaised = true
+  check("trailing prose outside JSON is rejected", trailingRaised)
+
+  var leadingRaised = false
+  try:
+    discard parseText(
+      "Here is my plan:\n```json\n{\"intent\":\"flee\",\"target\":\"none\"}\n```")
+  except CatchableError:
+    leadingRaised = true
+  check("leading prose before markdown fence is rejected", leadingRaised)
 
 block nestedBraces:
   let plan = parseText(
@@ -48,25 +62,58 @@ block nestedBraces:
   check("a brace inside a string does not end the object",
     plan.note == "a } inside a string")
 
-block missingFieldsDefault:
-  let plan = parseText("""{"target":"none"}""")
-  check("a missing intent defaults to hunt", plan.intent == "hunt")
-  check("a missing side defaults to any", plan.side == "any")
-  check("a missing with is empty", plan.partners.len == 0)
-  check("a missing say is empty", plan.say.len == 0)
+block optionalDefaultsAndRequiredFields:
+  let plan = parseText("""{"intent":"rest","target":"none"}""")
+  check("an omitted side defaults to any", plan.side == "any")
+  check("an omitted with defaults to empty", plan.partners.len == 0)
+  check("an omitted say defaults to empty", plan.say.len == 0)
+  check("an omitted note defaults to empty", plan.note.len == 0)
 
-block enumCoercion:
-  let plan = parseText(
-    """{"intent":"ponder","target":"none","side":"northwest"}""")
-  check("an unknown intent becomes hunt", plan.intent == "hunt")
-  check("an unknown side becomes any", plan.side == "any")
+  var missingIntent = false
+  try:
+    discard parseText("""{"target":"none"}""")
+  except CatchableError:
+    missingIntent = true
+  check("a missing intent is rejected", missingIntent)
 
-block allyFiltering:
-  let plan = parseText(
-    """{"target":"none","with":["Cog-A","nobody","Cog-B","Cog-C","Cog-D"]}""")
-  check("non-alias entries are dropped", "nobody" notin plan.partners)
-  check("the ally list is capped at three items",
-    plan.partners.len <= MaxWithItems)
+  var missingTarget = false
+  try:
+    discard parseText("""{"intent":"hunt"}""")
+  except CatchableError:
+    missingTarget = true
+  check("a missing target is rejected", missingTarget)
+
+block invalidEnumsRejected:
+  var badIntent = false
+  try:
+    discard parseText("""{"intent":"ponder","target":"none","side":"any"}""")
+  except CatchableError:
+    badIntent = true
+  check("an unknown intent is rejected (no silent coercion)", badIntent)
+
+  var badSide = false
+  try:
+    discard parseText("""{"intent":"hunt","target":"none","side":"northwest"}""")
+  except CatchableError:
+    badSide = true
+  check("an unknown side is rejected (no silent coercion)", badSide)
+
+block allyValidation:
+  var badAlly = false
+  try:
+    discard parseText(
+      """{"intent":"hunt","target":"none","with":["Cog-A","nobody"]}""")
+  except CatchableError:
+    badAlly = true
+  check("non-alias entries in with are rejected", badAlly)
+
+  var tooManyAllies = false
+  try:
+    discard parseText(
+      """{"intent":"hunt","target":"none","with":["Cog-A","Cog-B","Cog-C","Cog-D"]}""")
+  except CatchableError:
+    tooManyAllies = true
+  check("more than three allies in with is rejected", tooManyAllies)
 
 block illegalTarget:
   var raised = false
@@ -78,18 +125,25 @@ block illegalTarget:
 
 block retryContract:
   ## An unusable reply is retried EXACTLY once, with a hint that names the
-  ## two things that went wrong most often; after that the seat falls back.
-  check("the retry hint demands a leading brace",
-    "beginning with {" in RetryHint)
+  ## JSON contract and LEGAL TARGETS; after that the turn is missed.
+  check("the retry hint demands ONE JSON object",
+    "ONE JSON object" in RetryHint)
   check("the retry hint names LEGAL TARGETS",
     "LEGAL TARGETS" in RetryHint)
-  check("every fallback cause the design lists exists",
+  check("every failure cause exists",
     (block:
       var seen: seq[string] = @[]
       for cause in FallbackCause:
         seen.add($cause)
-      "timeout" in seen and "parse" in seen and "illegal_target" in seen and
-        "rate_budget" in seen and "no_credentials" in seen))
+      "timeout" in seen and "transport" in seen and "auth_failed" in seen and
+        "parse" in seen and "illegal_target" in seen and
+        "invalid_action" in seen and "rate_budget" in seen and
+        "no_credentials" in seen))
+  check("transport failures are classified separately from reply rejections",
+    isTransportFailure(fcNoCredentials) and isTransportFailure(fcAuth) and
+    isTransportFailure(fcTransport) and isTransportFailure(fcTimeout) and
+    not isTransportFailure(fcParse) and not isTransportFailure(fcIllegalTarget) and
+    not isTransportFailure(fcInvalidAction))
 
 block unparseable:
   var raised = false
@@ -116,37 +170,26 @@ block runeTruncation:
   check("the truncation is marked", plan.say.endsWith("\u2026"))
 
 block everyCapIsARuneCap:
-  ## Not just `say` and `note`: `intent`, `side`, `with` and `target` are cut
-  ## on rune boundaries too. Each of those four is coerced to a legal value
-  ## (or raises) before it could reach the replay, so a byte cut would not
-  ## be visible downstream today -- which is exactly why it has to be
-  ## asserted here rather than inferred from what survives.
-  let plan = parseText($(%*{
-    "intent": repeat("\u{1F98C}", 40),
-    "side": repeat("\u{1F98C}", 8),
-    "with": [repeat("\u00e9", 60), "Cog-A"],
-    "target": "none"
-  }))
-  check("an over-long intent coerces to the default", plan.intent == "hunt")
-  check("an over-long side coerces to any", plan.side == "any")
-  check("an over-long ally name is dropped, and a real one kept",
-    plan.partners == @["Cog-A"])
-  var raised = false
-  var message = ""
-  try:
-    discard parseText($(%*{
-      "target": repeat("\u{1F98C}", 200), "intent": "hunt"
-    }))
-  except CatchableError as error:
-    raised = true
-    message = error.msg
-  check("an over-long target is still an illegal target", raised)
-  check("the rejection message is valid UTF-8, so it is safe to record",
-    validateUtf8(message) == -1)
+  ## Over-long invalid enum/target values are rejected with valid UTF-8 errors.
+  for payload in [
+    $(%*{"intent": repeat("\u{1F98C}", 40), "target": "none"}),
+    $(%*{"intent": "hunt", "side": repeat("\u{1F98C}", 8), "target": "none"}),
+    $(%*{"intent": "hunt", "with": [repeat("\u00e9", 60)], "target": "none"}),
+    $(%*{"intent": "hunt", "target": repeat("\u{1F98C}", 200)})
+  ]:
+    var raised = false
+    var message = ""
+    try:
+      discard parseText(payload)
+    except CatchableError as error:
+      raised = true
+      message = error.msg
+    check("over-long invalid field is rejected with valid UTF-8",
+      raised and validateUtf8(message) == -1)
 
 block controlCharacters:
   let plan = parseText($(%*{
-    "target": "none", "say": "line one\nline two\ttabbed"
+    "intent": "hunt", "target": "none", "say": "line one\nline two\ttabbed"
   }))
   check("control characters are collapsed to spaces",
     '\n' notin plan.say and '\t' notin plan.say)
@@ -208,8 +251,8 @@ block observationIsBounded:
     "LEGAL TARGETS:" in observation and "BLOCKED TILES" in observation and
     "YOUR NOTE:" in observation)
   let systemPrompt = systemPromptFor(prompt, PromptSelection(), "staghunt")
-  check("the system prompt demands a leading brace",
-    "MUST begin with the character {" in systemPrompt)
+  check("the system prompt carries a concrete example",
+    "Example:" in systemPrompt)
   check("the system prompt carries the schema",
     "\"intent\"" in systemPrompt)
 
