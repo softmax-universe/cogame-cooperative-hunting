@@ -10,7 +10,7 @@
 ## ring buffer). Only `decide*` differs per bot, and those bodies are the
 ## starter's, not retuned in v1.
 ##
-## `big_game_hunter` is the default and the fallback baseline.
+## `big_game_hunter` is one of the eight explicit scripted baselines.
 ##
 ## The LLM executor in the player binary reuses `findKillSpot`,
 ## `bestCaptureSide` and `navigate` from here, exactly as the design note
@@ -161,17 +161,18 @@ type
     curAdjacentTicks*: int
 
 proc parseBaselineKind*(text: string): BaselineKind =
-  ## Anything unrecognised is `big_game_hunter`: it is the default and the
-  ## fallback baseline (`PLAYER_FALLBACK_SCRIPTED`).
+  ## Parse an explicit scripted baseline name. Unknown names raise ValueError.
   case text.strip().toLowerAscii()
   of "rabbiteer": bkRabbiteer
-  of "nearest_hunter", "nearest-hunter": bkNearestHunter
-  of "stag_hunter", "stag-hunter": bkStagHunter
-  of "moose_hunter", "moose-hunter": bkMooseHunter
-  of "elephant_hunter", "elephant-hunter": bkElephantHunter
+  of "nearest_hunter": bkNearestHunter
+  of "stag_hunter": bkStagHunter
+  of "moose_hunter": bkMooseHunter
+  of "elephant_hunter": bkElephantHunter
+  of "big_game_hunter": bkBigGameHunter
   of "sidekick": bkSidekick
   of "modeler": bkModeler
-  else: bkBigGameHunter
+  else:
+    raise newException(ValueError, "unknown scripted baseline: " & text)
 
 proc baselineName*(kind: BaselineKind): string =
   BaselineNames[kind.ord]

@@ -4,15 +4,14 @@
 ##                                  registers the prompt with the game and
 ##                                  executes the plans it gets back.
 ##   PLAYER_SCRIPTED=<name>         one of the eight compiled baselines.
-##   PLAYER_FALLBACK_SCRIPTED=<n>   what a prompt seat plays between plans
-##                                  and whenever a plan is unusable
-##                                  (default big_game_hunter).
 ##
 ## Skeleton from `Metta-AI/coworld-staghunt` `players/rabbiteer/rabbiteer.nim`
 ## (connect URL building, the drain loop, the input packet). The executor is
 ## the design note's: the plan chooses WHAT and WITH WHOM, this chooses which
 ## tile next, using the same `findKillSpot` / `bestCaptureSide` / `navigate`
-## the bundled bots use.
+## the bundled bots use. There is no scripted fallback for a prompt seat:
+## without a valid active plan (or when the model chooses target "none"), the
+## seat emits no movement input.
 
 import std/[json, options, os, parseopt, strutils, unicode]
 import whisky
@@ -57,20 +56,14 @@ type
 proc resolvePolicy(): Policy =
   let prompt = getEnv("PLAYER_PROMPT").strip()
   let scripted = getEnv("PLAYER_SCRIPTED").strip()
-  let fallback = getEnv("PLAYER_FALLBACK_SCRIPTED").strip()
-  # PLAYER_FALLBACK_SCRIPTED is what a PROMPT seat plays between plans and
-  # when a plan falls back; PLAYER_SCRIPTED is what a scripted seat plays,
-  # full stop. Reading the fallback first made it override PLAYER_SCRIPTED on
-  # a seat that carries both, so a scripted seat would have played a bot
-  # nobody asked it to play.
-  result.baseline =
-    if scripted.len > 0 and prompt.len == 0: parseBaselineKind(scripted)
-    elif fallback.len > 0: parseBaselineKind(fallback)
-    elif scripted.len > 0: parseBaselineKind(scripted)
-    else: bkBigGameHunter
   if prompt.len > 0:
     result.isPrompt = true
     result.prompt = runeCap(prompt, MaxPromptRunes)
+  elif scripted.len > 0:
+    result.isPrompt = false
+    result.baseline = parseBaselineKind(scripted)
+  else:
+    quit("cooperative-hunting-player: set PLAYER_PROMPT or PLAYER_SCRIPTED", 1)
 
 proc registrationBody(policy: Policy): string =
   if policy.isPrompt:
@@ -80,9 +73,14 @@ proc registrationBody(policy: Policy): string =
 
 proc registrationPacket(policy: Policy): string =
   ## `0x90 <u16 len little-endian> <len bytes UTF-8 JSON>`, len <= 4096.
-  var body = policy.registrationBody()
-  if body.len > MaxRegistrationBytes:
-    body = $(%*{"kind": "scripted", "baseline": "big_game_hunter"})
+  var effective = policy
+  var body = effective.registrationBody()
+  if body.len > MaxRegistrationBytes and effective.isPrompt:
+    var limit = effective.prompt.runeLen
+    while body.len > MaxRegistrationBytes and limit > 1:
+      limit = (limit * 3) div 4
+      effective.prompt = runeCap(effective.prompt, limit)
+      body = effective.registrationBody()
   var bytes: seq[uint8] = @[0x90'u8]
   bytes.add(uint8(body.len and 0xff))
   bytes.add(uint8((body.len shr 8) and 0xff))
@@ -107,10 +105,13 @@ proc parsePlanMessage*(data: string): ActivePlan =
   try:
     let node = parseJson(body)
     result.turn = node{"turn"}.getInt()
-    result.intent = node{"intent"}.getStr("hunt")
-    result.target = node{"target"}.getStr("none")
+    if node{"missed"}.getBool() or node{"src"}.getStr().startsWith("rejected:"):
+      result.valid = false
+      return
+    result.intent = node{"intent"}.getStr("")
+    result.target = node{"target"}.getStr("")
     result.side = node{"side"}.getStr("any")
-    result.valid = true
+    result.valid = result.intent.len > 0 and result.target.len > 0
     let at = result.target.rfind('@')
     if at > 0 and at + 1 < result.target.len:
       let coords = result.target[at + 1 .. ^1].split(',')
@@ -148,11 +149,12 @@ proc preyKindOfTarget(target: string): PreyKind =
   else: Boar
 
 proc decideWithPlan*(
-  bot: var Bot, plan: ActivePlan, fallback: BaselineKind
+  bot: var Bot, plan: ActivePlan
 ): uint8 =
-  ## Priority order: a capture this tick, then energy, then the plan, then
-  ## the fallback baseline. If the target has disappeared the hunter holds
-  ## position until the next plan rather than wandering off it.
+  ## Execute a valid multi-tick model plan. Without a valid active plan (before
+  ## the first plan arrives or after a missed/rejected turn), or when the model
+  ## explicitly chooses target "none", emit 0 (no input) rather than running a
+  ## scripted fallback.
   bot.deriveCamera()
   if not bot.cameraKnown:
     bot.intent = "no camera"
@@ -163,6 +165,16 @@ proc decideWithPlan*(
     bot.intent = "no self"
     return 0
   bot.updateObstacleMap()
+
+  if not plan.valid:
+    bot.intent = "no active plan; holding"
+    bot.updateStuckState(0)
+    return 0
+
+  if plan.target == "none" or not plan.hasCoords:
+    bot.intent = plan.intent & " target=none; holding"
+    bot.updateStuckState(0)
+    return 0
 
   let killSpot = bot.findKillSpot()
   if killSpot.found:
@@ -176,14 +188,6 @@ proc decideWithPlan*(
     bot.intent = "resting (energy " & $bot.energy & ")"
     bot.updateStuckState(0)
     return 0
-
-  if not plan.valid or plan.target == "none" or not plan.hasCoords:
-    var scripted = bot
-    scripted.kind = fallback
-    let mask = scripted.decideMask()
-    bot = scripted
-    bot.intent = "no usable plan; " & baselineName(fallback) & ": " & bot.intent
-    return mask
 
   # Is the named thing still there? The plan carries the tile it was on;
   # accept anything within one tile of it so a step of drift does not throw
@@ -323,7 +327,7 @@ proc runPlayer(
             if message.get.kind == BinaryMessage and data.len > 0:
               if data[0].uint8 == 0x91'u8:
                 let next = parsePlanMessage(data)
-                if next.valid:
+                if next.valid or next.turn > 0:
                   plan = next
               elif bot.applySpritePacket(data):
                 inc bot.frameTick
@@ -340,7 +344,7 @@ proc runPlayer(
           continue
         let mask =
           if policy.isPrompt:
-            bot.decideWithPlan(plan, policy.baseline)
+            bot.decideWithPlan(plan)
           else: bot.decideMask()
         if mask != lastMask:
           ws.send(playerInputBlob(mask), BinaryMessage)

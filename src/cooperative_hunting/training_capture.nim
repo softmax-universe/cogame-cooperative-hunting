@@ -136,10 +136,8 @@ proc flush(capture: RuntimeCapture, frozen: CapturedTurn) =
           else: "proposal was not the selected unmodified installed plan")
   capture.trajectory.recordDecision(turnKey(frozen.turn, frozen.slot), $frozen.slot,
     frozen.observation, frozen.attempts, selected, frozen.action,
-    (if selected.isSome: asAccepted
-     elif ran and not frozen.modelPlan: asFallback else: asRejected),
-    fallbackOrigin = (if ran and not frozen.modelPlan: some("native_scripted_controller")
-      else: none(string)), execution = execution)
+    (if selected.isSome: asAccepted else: asRejected),
+    fallbackOrigin = none(string), execution = execution)
 
 proc delivered*(capture: RuntimeCapture, slot, tick: int, plan: Plan) =
   ## Called only after 0x91 send succeeds; the observed subsequent input stream
@@ -155,8 +153,8 @@ proc delivered*(capture: RuntimeCapture, slot, tick: int, plan: Plan) =
   let frozen = capture.pending[key]
   frozen.delivered = true
   frozen.startTick = tick
-  frozen.action = plan.planActionJson()
   frozen.modelPlan = plan.src == "llm"
+  frozen.action = if frozen.modelPlan: plan.planActionJson() else: newJNull()
   capture.active[slot] = frozen
 
 proc appliedInputs*(capture: RuntimeCapture, inputs: openArray[InputState], playing: bool) =

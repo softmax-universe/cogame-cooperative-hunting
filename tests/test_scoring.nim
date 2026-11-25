@@ -192,7 +192,7 @@ block resultsShape:
   config.ticksPerRound = 90
   config.players = @["alpha", "bravo", "charlie", "delta", "echo", "foxtrot"]
   let results = runAndRead(config, getTempDir() / "ch-scoring-shape")
-  for key in ["names", "aliases", "kinds", "scores", "energy", "fallbacks",
+  for key in ["names", "aliases", "kinds", "scores", "energy", "missed_turns",
       "disconnected", "catches", "co_captures"]:
     check("results." & key & " has one entry per seat",
       results[key].len == config.numAgents)

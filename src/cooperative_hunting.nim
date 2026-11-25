@@ -53,7 +53,7 @@ type
     note: string
     lastPlan: Plan
     skipNextTurn: bool
-    fallbacks: int
+    missedTurns: int
 
   WebSocketAppState = object
     lock: Lock
@@ -178,6 +178,7 @@ proc llmWorker(config: GameConfig) {.thread.} =
           "slot": r.slot,
           "ok": r.ok,
           "cause": $r.cause,
+          "error": r.error,
           "intent": r.plan.intent,
           "target": r.plan.target,
           "side": r.plan.side,
@@ -214,6 +215,7 @@ type
     turnsTotal: int
     reason: EndReason
     finished: bool
+    fatalError: string
     roundEndTick: int
     batchInFlight: bool
     turnsSkipped: int
@@ -312,7 +314,7 @@ proc resultsJson(ep: Episode): JsonNode =
     kinds = newJArray()
     scores = newJArray()
     energy = newJArray()
-    fallbacks = newJArray()
+    missedTurns = newJArray()
     disconnected = newJArray()
     roundsArr = newJArray()
     catchesArr = newJArray()
@@ -330,7 +332,7 @@ proc resultsJson(ep: Episode): JsonNode =
     kinds.add(%policyKindName(ep.seats[i].kind))
     scores.add(%max(0, totals[i]))
     energy.add(%p.energy)
-    fallbacks.add(%ep.seats[i].fallbacks)
+    missedTurns.add(%ep.seats[i].missedTurns)
     disconnected.add(%ep.seats[i].disconnected)
     var catches = newJArray()
     for kind in PreyKind:
@@ -354,7 +356,7 @@ proc resultsJson(ep: Episode): JsonNode =
     "kinds": kinds,
     "scores": scores,
     "energy": energy,
-    "fallbacks": fallbacks,
+    "missed_turns": missedTurns,
     "disconnected": disconnected,
     "rounds": roundsArr,
     "catches": catchesArr,
@@ -533,22 +535,25 @@ proc pollPlanBatch(ep: var Episode) =
       })
     else:
       let cause = node{"cause"}.getStr("parse")
-      plan.src = "fallback:" & cause
-      plan.target = "none"
-      plan.intent = "hunt"
-      ep.seats[index].lastPlan = plan
+      let errMsg = node{"error"}.getStr("")
+      if cause in ["no_credentials", "auth_failed", "transport", "timeout", "rate_budget"]:
+        ep.fatalError = "LLM transport failure (slot " & $ep.seats[index].slot &
+          ", cause=" & cause & "): " & errMsg
+        ep.finished = true
+        return
+      plan = Plan(turn: turn, src: "rejected:" & cause)
+      ep.seats[index].lastPlan = Plan()
       ep.planForSeat[index] = plan
       ep.planReady[index] = true
       # A seat that consumed a retry skips its NEXT planning turn, so the
       # worst case stays at 2 requests per seat per 30 s = 24 req/min.
       ep.seats[index].skipNextTurn = true
-      inc ep.seats[index].fallbacks
-      ep.sim.logEvent("fallback", %*{
+      inc ep.seats[index].missedTurns
+      ep.sim.logEvent("missed_turn", %*{
         "alias": ep.sim.players[index].alias,
-        "baseline": (if ep.seats[index].baseline.len > 0:
-                       ep.seats[index].baseline
-                     else: "big_game_hunter"),
-        "cause": cause
+        "turn": turn,
+        "cause": cause,
+        "error": runeCap(errMsg, MaxErrorRunes)
       })
 
 proc drainPrivateFinalReply(ep: var Episode) =
@@ -560,18 +565,27 @@ proc drainPrivateFinalReply(ep: var Episode) =
     ep.capture.received(parseJson(got.msg))
 
 proc planPacket*(plan: Plan): seq[uint8] =
-  var partners = newJArray()
-  for p in plan.partners:
-    partners.add(%p)
-  let body = $(%*{
-    "turn": plan.turn,
-    "intent": plan.intent,
-    "target": plan.target,
-    "side": plan.side,
-    "with": partners,
-    "say": plan.say,
-    "src": plan.src
-  })
+  let body =
+    if plan.src.startsWith("rejected:"):
+      $(%*{
+        "turn": plan.turn,
+        "missed": true,
+        "cause": plan.src["rejected:".len .. ^1],
+        "src": plan.src
+      })
+    else:
+      var partners = newJArray()
+      for p in plan.partners:
+        partners.add(%p)
+      $(%*{
+        "turn": plan.turn,
+        "intent": plan.intent,
+        "target": plan.target,
+        "side": plan.side,
+        "with": partners,
+        "say": plan.say,
+        "src": plan.src
+      })
   result.add(MsgPlan)
   result.add(uint8(body.len and 0xff))
   result.add(uint8((body.len shr 8) and 0xff))
@@ -586,6 +600,8 @@ proc advance(ep: var Episode, inputs: openArray[InputState]) =
   ## One tick of the episode, including the round card and the deadline
   ## guard. Returns with `ep.finished` set when the episode has settled.
   ep.pollPlanBatch()
+  if ep.fatalError.len > 0:
+    return
   case ep.sim.phase
   of RoundPlaying:
     ep.sim.step(inputs)
@@ -667,6 +683,8 @@ proc runEpisodeOffline*(
     for slot in 0 ..< config.numAgents:
       inputs.add(decodeInputMask(masks[slot]))
     ep.advance(inputs)
+    if ep.fatalError.len > 0:
+      break
     let final = if ep.finished: ep.finalNode() else: nil
     let label = ep.currentChromeLabel(final)
     discard label
@@ -934,7 +952,7 @@ proc writeNoPlayersResults(config: GameConfig, selection: PromptSelection) =
     kinds = newJArray()
     scores = newJArray()
     energy = newJArray()
-    fallbacks = newJArray()
+    missedTurns = newJArray()
     disconnected = newJArray()
     catchesArr = newJArray()
     coCapturesArr = newJArray()
@@ -946,7 +964,7 @@ proc writeNoPlayersResults(config: GameConfig, selection: PromptSelection) =
     kinds.add(%"scripted")
     scores.add(%0)
     energy.add(%0)
-    fallbacks.add(%0)
+    missedTurns.add(%0)
     disconnected.add(%true)
     var catches = newJArray()
     for _ in 0 ..< 5:
@@ -959,7 +977,7 @@ proc writeNoPlayersResults(config: GameConfig, selection: PromptSelection) =
   var roundsArr = newJArray()
   let results = %*{
     "names": names, "aliases": aliases, "kinds": kinds, "scores": scores,
-    "energy": energy, "fallbacks": fallbacks, "disconnected": disconnected,
+    "energy": energy, "missed_turns": missedTurns, "disconnected": disconnected,
     "rounds": roundsArr, "catches": catchesArr,
     "co_captures": coCapturesArr, "llm_requests": 0,
     "variant": config.variant, "seed": config.seed, "final_tick": 0,
@@ -1057,6 +1075,13 @@ proc runServerLoop(host: string, port: int, config: GameConfig, selection: Promp
     if seat.kind == pkPrompt:
       ep.llmEnabled = true
   if ep.llmEnabled:
+    let startupClient = newLlmClient(config)
+    if not startupClient.hasLlmCredentials():
+      let msg = "FATAL: prompt seat registered but no LLM credentials/endpoint configured"
+      echo msg
+      ep.capture.finishCapture(ep.resultsJson(), msg)
+      httpServer.close()
+      quit(1)
     planRequests.open()
     planReplies.open()
     createThread(llmThread, llmWorker, config)
@@ -1108,6 +1133,8 @@ proc runServerLoop(host: string, port: int, config: GameConfig, selection: Promp
       ep.dispatchPlanBatch()
 
     ep.advance(inputs)
+    if ep.fatalError.len > 0:
+      break
 
     let final = if ep.finished: ep.finalNode() else: nil
     let label = ep.currentChromeLabel(final)
@@ -1187,6 +1214,19 @@ proc runServerLoop(host: string, port: int, config: GameConfig, selection: Promp
     if elapsed < frameDuration:
       sleep(int((frameDuration - elapsed).inMilliseconds))
     lastTick = getMonoTime()
+
+  if ep.fatalError.len > 0:
+    echo "FATAL: ", ep.fatalError
+    if llmThreadRunning:
+      planRequests.send("quit")
+      joinThread(llmThread)
+      ep.drainPrivateFinalReply()
+      planRequests.close()
+      planReplies.close()
+      llmThreadRunning = false
+    ep.capture.finishCapture(ep.resultsJson(), ep.fatalError)
+    httpServer.close()
+    quit(1)
 
   echo "episode settled: reason=", ep.reason, " tick=", ep.sim.globalTick
   ep.writeArtifacts()

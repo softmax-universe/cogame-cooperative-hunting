@@ -251,8 +251,10 @@ planning turn (every 120 ticks).
  "with": ["Cog-A"], "say": "...", "src": "llm"}
 ```
 
-`src` is `llm` or `fallback:<cause>`. Scripted seats never receive it, because
-the bundled bots' parsers reject unknown message types.
+`src` is `llm` or `rejected:<cause>` (with `"missed": true` on a rejected turn,
+which clears the seat's active plan so it sends no movement input until the next
+planning turn). Scripted seats never receive `0x91`, because the bundled bots'
+parsers reject unknown message types.
 
 ### `0x92` server -> client, seat information
 
@@ -292,24 +294,31 @@ prompt seats' requests as one parallel batch, and hands each seat back a plan.
 The player's executor walks the hunter to the named side tile by tile until
 the next plan.
 
-The model must reply with a single JSON object beginning with `{`:
+The model must reply with a single JSON object (optionally inside a standard
+outer ```` ```json ... ``` ```` fence) and nothing else:
 
 | field | type | cap | rule |
 | --- | --- | --- | --- |
-| `intent` | enum | 12 chars | `hunt,assist,forage,rest,regroup,flee`; anything else becomes `hunt` |
-| `target` | string | 24 chars | must be in `LEGAL TARGETS` or `none`, else the reply is retried once |
-| `side` | enum | 3 chars | `N,S,E,W,any`; anything else becomes `any` |
-| `with` | string array | <= 3 items, 8 chars each | non-alias entries dropped |
-| `say` | free text | <= 120 runes | broadcast to spectators |
-| `note` | free text | <= 200 runes | private, handed back next turn |
+| `intent` | enum (required) | 12 chars | one of `hunt,assist,forage,rest,regroup,flee`; invalid values are rejected |
+| `target` | string (required) | 24 chars | must be in `LEGAL TARGETS` (including `none`); invalid values are rejected |
+| `side` | enum (optional) | 3 chars | `N,S,E,W,any` (defaults to `any` if omitted; invalid values are rejected) |
+| `with` | string array (optional) | <= 3 items, 8 chars each | valid ally aliases (defaults to `[]` if omitted; unknown aliases are rejected) |
+| `say` | free text (optional) | <= 120 runes | broadcast to spectators (defaults to `""`) |
+| `note` | free text (optional) | <= 200 runes | private, handed back next turn (defaults to `""`) |
+
+Example:
+```json
+{"intent":"hunt","target":"rabbit@14,12","side":"any","with":[],"say":"Taking rabbit","note":"solo"}
+```
 
 Every free-text field is truncated on **rune** boundaries.
 
-An unusable reply is retried exactly once with a hint; if that also fails the
-seat plays `PLAYER_FALLBACK_SCRIPTED` (default `big_game_hunter`) for that
-planning window and a `fallback` event is written with its cause. With no
-credentials at all the client disables itself at startup and makes zero
-network calls -- the episode still completes with `reason: complete`.
+A rejected reply is retried once with a hint; if the retry is also rejected the
+turn is recorded as a missed turn (`missed_turn` event, `missed_turns` counter)
+and the seat holds with no movement input until the next planning turn — no
+scripted fallback is substituted. Missing credentials, auth failures, or
+transport/network failures terminate the episode with an explicit non-zero
+failure rather than fabricating normal results.
 
 ## `PLAYER_SCRIPTED` -- a compiled baseline
 
@@ -351,7 +360,11 @@ BUNDLED = [
         ),
         "image": IMAGE,
         "run": ["/bin/cooperative-hunting-player"],
-        "env": {"PLAYER_PROMPT": PLAYER_PROMPT_DEFAULT},
+        "env": {
+            "PLAYER_PROMPT": PLAYER_PROMPT_DEFAULT,
+            "COWORLD_LLM_ENABLED": "true",
+            "COWORLD_LLM_MODEL": "anthropic/claude-haiku-4.5",
+        },
         "source_url": REPO,
     },
     {
@@ -598,7 +611,7 @@ RESULTS_SCHEMA = {
         "kinds": str_array("'prompt', 'scripted', or 'external' per seat."),
         "scores": int_array("Cumulative score per seat across all rounds. Higher is better; never negative."),
         "energy": int_array("Final energy per seat."),
-        "fallbacks": int_array("Planning turns on which this seat fell back to its scripted baseline."),
+        "missed_turns": int_array("Planning turns on which this seat's model reply was rejected and the seat missed its turn."),
         "disconnected": {
             "description": "Whether each seat's socket closed before the episode ended.",
             "type": "array",
@@ -758,9 +771,9 @@ manifest = {
         },
         "players": [
             {"player_id": "pack-caller"},
-            {"player_id": "pack-caller"},
             {"player_id": "big-game-hunter"},
             {"player_id": "big-game-hunter"},
+            {"player_id": "sidekick"},
             {"player_id": "sidekick"},
             {"player_id": "modeler"},
         ],

@@ -87,7 +87,7 @@ proc updatePlayers(state: var PlanGame) =
     for i, value in frame: blob[i] = char(value)
     doAssert state.bots[seat].applySpritePacket(blob)
     inc state.bots[seat].frameTick
-    state.masks[seat] = state.bots[seat].decideWithPlan(state.plans[seat], bkBigGameHunter)
+    state.masks[seat] = state.bots[seat].decideWithPlan(state.plans[seat])
 
 proc advancePlans*(state: var PlanGame) =
   ## All six proposals were parsed against the same frozen planning boundary.

@@ -67,7 +67,7 @@ block completeEpisode:
   check("the episode logs an episode_end", "episode_end" in kinds)
   const Vocabulary = [
     "round_start", "player_spawn", "prey_spawn", "catch", "mine", "pickup",
-    "forage", "tag", "trample", "moose_gut", "plan", "fallback", "deadline",
+    "forage", "tag", "trample", "moose_gut", "plan", "missed_turn", "deadline",
     "round_end", "episode_end"
   ]
   check("the episode emits only events in the declared vocabulary",

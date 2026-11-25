@@ -49,10 +49,11 @@ message. Every 120 ticks (15 s at 8 Hz) the game composes one observation per
 prompt seat — from exactly that seat's visibility set — and issues **all**
 prompt seats' requests as one parallel batch, because decisions in this game
 are simultaneous. Each seat gets a plan back over `0x91` and its executor
-walks the hunter to the named side tile by tile. An unusable reply is retried
-once and then falls back to `PLAYER_FALLBACK_SCRIPTED` (default
-`big_game_hunter`). With no credentials at all the client disables itself and
-makes zero network calls; the episode still completes.
+walks the hunter to the named side tile by tile. A rejected reply is retried
+once and then recorded as a missed turn (`missed_turn` event, no scripted
+fallback). Missing credentials, auth failures, or transport/network failures
+terminate the episode with an explicit non-zero failure rather than fabricating
+normal results.
 
 External policies can request private seat information with `seat_info: true`
 in their `kind: "external"` registration. They receive their role and the roles

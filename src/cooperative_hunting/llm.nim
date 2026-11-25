@@ -1,20 +1,18 @@
 ## The LLM half of a champion policy.
 ##
-## Ported from `cogame-bullwhip/src/bullwhip/llm.nim`: same transport ladder
-## (Bedrock sidecar via `AWS_ENDPOINT_URL_BEDROCK_RUNTIME` +
-## `AWS_BEARER_TOKEN_BEDROCK`, else `ANTHROPIC_API_KEY`, else
-## `ANTHROPIC_API_KEY_URI`, else disabled), same haiku-first model list, same
-## `curly.makeRequests` ONE-parallel-batch shape, same tolerant parse ->
-## retry once -> scripted fallback.
+## Transport ladder: Coworld sidecar (`COWORLD_LLM_ENDPOINT`), else Bedrock
+## (`AWS_ENDPOINT_URL_BEDROCK_RUNTIME` / `AWS_BEARER_TOKEN_BEDROCK`), else
+## `ANTHROPIC_API_KEY` / `ANTHROPIC_API_KEY_URI`.
 ##
 ## Decisions in this game are SIMULTANEOUS, so every prompt seat's request
 ## goes out in the same batch. The batch has a 12 s deadline and the sim
 ## never waits on it: hunters keep executing their previous plan while it is
 ## in flight, so the LLM contributes 0 s to the critical path.
 ##
-## With no credentials at all the client marks itself disabled at startup and
-## makes ZERO network calls; every prompt seat plays the fallback baseline
-## and the episode still completes with `reason: complete`.
+## Missing credentials, auth failures, or transport/network failures end the
+## episode with an explicit failure rather than substituting a scripted bot or
+## fabricating normal results. Malformed or illegal model replies are retried
+## once and then recorded as a missed turn with no synthesized action.
 
 import std/[algorithm, json, monotimes, options, os, sequtils, strutils, times, unicode]
 import curly
@@ -38,21 +36,27 @@ const
   LegalIntents* = ["hunt", "assist", "forage", "rest", "regroup", "flee"]
   LegalSides* = ["N", "S", "E", "W", "any"]
 
-  RetryHint* = "Your last reply was not usable. Reply with ONE JSON object " &
-    "beginning with { and a target from LEGAL TARGETS."
+  RetryHint* = "Your last reply was rejected. Reply with ONE JSON object " &
+    "(optionally inside a ```json ... ``` fence) with a valid intent and a target from LEGAL TARGETS."
 
-  ResponseContract = """Reply with a single JSON object and NOTHING else. Your reply MUST begin with the character {.
+  ResponseContract = """Reply with a single JSON object (optionally inside a ```json ... ``` fence) and NOTHING else.
 Schema:
 {"intent":"hunt|assist|forage|rest|regroup|flee","target":"<one id from LEGAL TARGETS, or none>",
  "side":"N|S|E|W|any","with":["<ally alias>",...],"say":"<=120 chars","note":"<=200 chars"}
+Example:
+{"intent":"hunt","target":"rabbit@14,12","side":"any","with":[],"say":"Taking rabbit","note":"solo"}
+"side" defaults to "any", "with" defaults to [], and "say"/"note" default to "" if omitted.
 "say" is broadcast to spectators. "note" is private and is handed back to you next turn."""
 
 type
   FallbackCause* = enum
     fcNone = ""
     fcTimeout = "timeout"
+    fcTransport = "transport"
+    fcAuth = "auth_failed"
     fcParse = "parse"
     fcIllegalTarget = "illegal_target"
+    fcInvalidAction = "invalid_action"
     fcRateBudget = "rate_budget"
     fcNoCredentials = "no_credentials"
 
@@ -64,7 +68,7 @@ type
     partners*: seq[string]
     say*: string
     note*: string
-    src*: string          ## "llm" or "fallback:<cause>"
+    src*: string          ## "llm" or "rejected:<cause>"
 
   PlanRequest* = object
     slot*: int
@@ -186,8 +190,13 @@ proc newLlmClient*(config: GameConfig): LlmClient =
   else:
     result.transport = ltNone
     result.disabled = true
-    echo "cooperative-hunting llm: no LLM credentials; every prompt seat ",
-      "plays the scripted fallback and no network call is made"
+    echo "cooperative-hunting llm: no LLM credentials configured"
+
+proc hasLlmCredentials*(client: LlmClient): bool =
+  not client.isNil and not client.disabled and client.transport != ltNone
+
+proc isTransportFailure*(cause: FallbackCause): bool =
+  cause in {fcNoCredentials, fcAuth, fcTransport, fcTimeout, fcRateBudget}
 
 proc newDisabledLlmClient*(): LlmClient =
   ## The offline client used by the tests and by any episode with no
@@ -440,40 +449,34 @@ proc systemPromptFor*(prompt: string, selection: PromptSelection, variant: strin
 # ---------------------------------------------------------------------------
 
 proc extractJsonObject*(text: string): JsonNode =
-  ## Takes the first balanced {...} span, tolerating leading and trailing
-  ## prose and markdown fences.
-  var start = -1
-  var depth = 0
-  var inString = false
-  var escaped = false
-  for i, ch in text:
-    if inString:
-      if escaped:
-        escaped = false
-      elif ch == '\\':
-        escaped = true
-      elif ch == '"':
-        inString = false
-      continue
-    case ch
-    of '"':
-      inString = true
-    of '{':
-      if depth == 0:
-        start = i
-      inc depth
-    of '}':
-      if depth > 0:
-        dec depth
-        if depth == 0 and start >= 0:
-          return parseJson(text[start .. i])
-    else:
-      discard
-  var head = text.strip()
-  if head.runeLen > 160:
-    head = runeCap(head, 160) & "..."
-  raise newException(ChError,
-    "no balanced JSON object in reply: " & head.replace("\n", " "))
+  ## Parses a single JSON object, optionally wrapped in a standard outer
+  ## Markdown JSON fence (```json ... ``` or ``` ... ```). Rejects extra prose.
+  var candidate = text.strip()
+  if candidate.startsWith("```"):
+    let firstNl = candidate.find('\n')
+    if firstNl < 0:
+      raise newException(ChError, "unclosed markdown fence in reply")
+    let fenceHeader = candidate[3 ..< firstNl].strip().toLowerAscii()
+    if fenceHeader.len > 0 and fenceHeader != "json":
+      raise newException(ChError, "unsupported markdown fence language: " & fenceHeader)
+    var body = candidate[firstNl + 1 .. ^1]
+    if not body.endsWith("```"):
+      raise newException(ChError, "unclosed markdown fence in reply")
+    body = body[0 ..< body.len - 3].strip()
+    candidate = body
+  if candidate.len == 0 or candidate[0] != '{' or candidate[^1] != '}':
+    var head = text.strip()
+    if head.runeLen > 160:
+      head = runeCap(head, 160) & "..."
+    raise newException(ChError,
+      "reply must be a single JSON object (optionally in a ```json fence): " &
+      head.replace("\n", " "))
+  try:
+    result = parseJson(candidate)
+  except CatchableError as error:
+    raise newException(ChError, "invalid JSON object: " & error.msg)
+  if result.kind != JObject:
+    raise newException(ChError, "reply JSON must be an object")
 
 proc cleanText*(text: string, limit: int): string =
   ## Rune-boundary truncation, never a byte boundary.
@@ -485,44 +488,67 @@ proc cleanText*(text: string, limit: int): string =
 proc parsePlan*(
   payload: JsonNode, turn: int, legal: seq[string], aliases: seq[string]
 ): Plan =
-  ## Unknown keys ignored; every out-of-range enum coerced to its default;
-  ## an out-of-set `target` is ILLEGAL and raises, which is what triggers
-  ## the single retry.
+  ## Strict validation with straightforward documented defaults for omitted
+  ## optional fields (`side`, `with`, `say`, `note`). No silent coercion of
+  ## invalid values.
+  if payload.isNil or payload.kind != JObject:
+    raise newException(ChError, "plan payload must be a JSON object")
   result.turn = turn
   result.src = "llm"
 
-  # Every cap in this proc is a RUNE cap. None of these four values can
-  # reach the replay byte-cut (each is coerced to a legal value or raises
-  # below), but "every string is cut on a rune boundary" is a property of
-  # the parser, not of what happens to survive it today.
-  let intent = runeCap(payload{"intent"}.getStr().strip().toLowerAscii(),
-    MaxIntentChars)
-  result.intent = if intent in LegalIntents: intent else: "hunt"
+  if not payload.hasKey("intent") or payload["intent"].kind != JString:
+    raise newException(ChError, "invalid action: missing or non-string intent")
+  let intent = payload["intent"].getStr().strip()
+  if intent notin LegalIntents:
+    raise newException(ChError, "invalid action: unknown intent: " &
+      runeCap(intent, MaxIntentChars))
+  result.intent = intent
 
-  let side = runeCap(payload{"side"}.getStr().strip(), MaxSideChars)
-  let sideUpper = side.toUpperAscii()
-  result.side =
-    if sideUpper in ["N", "S", "E", "W"]: sideUpper
-    else: "any"
+  if not payload.hasKey("target") or payload["target"].kind != JString:
+    raise newException(ChError, "target not in LEGAL TARGETS: missing or non-string target")
+  let target = payload["target"].getStr().strip()
+  if target.len == 0 or target notin legal:
+    raise newException(ChError, "target not in LEGAL TARGETS: " &
+      runeCap(target, MaxTargetChars))
+  result.target = target
 
-  let withNode = payload{"with"}
-  if not withNode.isNil and withNode.kind == JArray:
+  if payload.hasKey("side"):
+    if payload["side"].kind != JString:
+      raise newException(ChError, "invalid action: side must be a string")
+    let side = payload["side"].getStr().strip()
+    if side notin LegalSides:
+      raise newException(ChError, "invalid action: unknown side: " &
+        runeCap(side, MaxSideChars))
+    result.side = side
+  else:
+    result.side = "any"
+
+  if payload.hasKey("with"):
+    let withNode = payload["with"]
+    if withNode.kind != JArray:
+      raise newException(ChError, "invalid action: with must be an array")
+    if withNode.len > MaxWithItems:
+      raise newException(ChError, "invalid action: with exceeds max items (" &
+        $MaxWithItems & ")")
     for entry in withNode:
-      if result.partners.len >= MaxWithItems:
-        break
-      let name = runeCap(entry.getStr().strip(), MaxWithChars)
-      if name in aliases and name notin result.partners:
+      if entry.kind != JString:
+        raise newException(ChError, "invalid action: with entries must be strings")
+      let name = entry.getStr().strip()
+      if name notin aliases:
+        raise newException(ChError, "invalid action: unknown ally in with: " &
+          runeCap(name, MaxWithChars))
+      if name notin result.partners:
         result.partners.add(name)
 
-  result.say = cleanText(payload{"say"}.getStr(), MaxSayRunes)
-  result.note = cleanText(payload{"note"}.getStr(), MaxNoteRunes)
+  if payload.hasKey("say"):
+    if payload["say"].kind != JString:
+      raise newException(ChError, "invalid action: say must be a string")
+    result.say = cleanText(payload["say"].getStr(), MaxSayRunes)
 
-  var target = runeCap(payload{"target"}.getStr().strip(), MaxTargetChars)
-  if target.len == 0:
-    target = "none"
-  if target notin legal:
-    raise newException(ChError, "target not in LEGAL TARGETS: " & target)
-  result.target = target
+  if payload.hasKey("note"):
+    if payload["note"].kind != JString:
+      raise newException(ChError, "invalid action: note must be a string")
+    result.note = cleanText(payload["note"].getStr(), MaxNoteRunes)
 
 # ---------------------------------------------------------------------------
 # Transport
@@ -614,10 +640,12 @@ proc runPlanBatch*(
   if client.isNil or client.disabled:
     for i in 0 ..< result.len:
       result[i].cause = fcNoCredentials
+      result[i].error = "no LLM credentials configured"
     return
   if not client.budgetAvailable(requests.len):
     for i in 0 ..< result.len:
       result[i].cause = fcRateBudget
+      result[i].error = "rate budget exceeded"
     return
 
   var open = toSeq(0 ..< requests.len)
@@ -665,8 +693,11 @@ proc runPlanBatch*(
         result[index].error = message
         result[index].cause =
           if "LEGAL TARGETS" in message: fcIllegalTarget
-          elif "transport" in message or "timed out" in message or
-               "timeout" in message: fcTimeout
+          elif "invalid action:" in message: fcInvalidAction
+          elif "llm auth failed" in message or "model access denied" in message: fcAuth
+          elif "timed out" in message or "timeout" in message: fcTimeout
+          elif "llm transport:" in message or "llm throttled" in message or
+               "anthropic error " in message: fcTransport
           else: fcParse
         echo "cooperative-hunting llm: slot ", requests[index].slot,
           " attempt ", attempt, " failed: ", message

@@ -140,8 +140,12 @@ block registrationBodies:
     except CatchableError:
       parsed = false
     check(baselineName(kind) & " registration is valid JSON", parsed)
-  check("an unknown baseline name resolves to big_game_hunter",
-    parseBaselineKind("nope") == bkBigGameHunter)
+  var unknownRaised = false
+  try:
+    discard parseBaselineKind("nope")
+  except ValueError:
+    unknownRaised = true
+  check("an unknown baseline name raises ValueError", unknownRaised)
   check("every declared baseline name round-trips",
     (block:
       var ok = true
