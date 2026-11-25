@@ -28,6 +28,9 @@ const
   MsgPlan = 0x91'u8
   MsgSeatInfo = 0x92'u8
 
+  CogamePlayerFailureUriEnv* = "COGAME_PLAYER_FAILURE_URI"
+  CogamePlayerFailureMethodEnv* = "COGAME_PLAYER_FAILURE_METHOD"
+
   ## After the artifacts are written, /healthz and /global keep answering for
   ## this long before quit(0). The certification runner pings /global AFTER
   ## the player pods start and a fast exit fails the episode (lantern 0.1.3).
@@ -194,6 +197,7 @@ proc llmWorker(config: GameConfig) {.thread.} =
       }
     except CatchableError as error:
       echo "cooperative-hunting llm worker: ", error.msg
+      reply["worker_error"] = %error.msg
     planReplies.send($reply)
 
 # ---------------------------------------------------------------------------
@@ -216,6 +220,9 @@ type
     reason: EndReason
     finished: bool
     fatalError: string
+    fatalKind: string
+    fatalSlot: int
+    fatalPublicMessage: string
     roundEndTick: int
     batchInFlight: bool
     turnsSkipped: int
@@ -397,6 +404,7 @@ proc newEpisode(config: GameConfig, seats: seq[Seat], selection: PromptSelection
   result.sim = initSim(config)
   result.sim.art.buildSpriteCache()
   result.reason = erComplete
+  result.fatalSlot = -1
   result.turnsTotal = max(1,
     (config.rounds * config.ticksPerRound) div max(1, config.planIntervalTicks))
   result.planForSeat = newSeq[Plan](seats.len)
@@ -500,6 +508,19 @@ proc pollPlanBatch(ep: var Episode) =
   if reply{"disabled"}.getBool():
     ep.llmEnabled = false
   let turn = reply{"turn"}.getInt()
+  let workerError = reply{"worker_error"}.getStr("")
+  if workerError.len > 0:
+    var slot = 0
+    for seat in ep.seats:
+      if seat.kind == pkPrompt:
+        slot = seat.slot
+        break
+    ep.fatalError = "LLM worker error (slot " & $slot & "): " & workerError
+    ep.fatalKind = "episode_inconclusive"
+    ep.fatalSlot = slot
+    ep.fatalPublicMessage = "Model service unavailable"
+    ep.finished = true
+    return
   let plans = reply{"plans"}
   if plans.isNil or plans.kind != JArray:
     return
@@ -536,25 +557,32 @@ proc pollPlanBatch(ep: var Episode) =
     else:
       let cause = node{"cause"}.getStr("parse")
       let errMsg = node{"error"}.getStr("")
+      let seatSlot = ep.seats[index].slot
       if cause in ["no_credentials", "auth_failed", "transport", "timeout", "rate_budget"]:
-        ep.fatalError = "LLM transport failure (slot " & $ep.seats[index].slot &
+        ep.fatalError = "LLM transport failure (slot " & $seatSlot &
           ", cause=" & cause & "): " & errMsg
+        ep.fatalKind = "episode_inconclusive"
+        ep.fatalSlot = seatSlot
+        ep.fatalPublicMessage =
+          case cause
+          of "no_credentials": "Model endpoint or credentials not configured"
+          of "auth_failed": "Model service authentication failed"
+          of "timeout": "Model service request timed out"
+          of "rate_budget": "Model service rate budget exceeded"
+          else: "Model service unavailable"
         ep.finished = true
         return
-      plan = Plan(turn: turn, src: "rejected:" & cause)
-      ep.seats[index].lastPlan = Plan()
-      ep.planForSeat[index] = plan
-      ep.planReady[index] = true
-      # A seat that consumed a retry skips its NEXT planning turn, so the
-      # worst case stays at 2 requests per seat per 30 s = 24 req/min.
-      ep.seats[index].skipNextTurn = true
-      inc ep.seats[index].missedTurns
-      ep.sim.logEvent("missed_turn", %*{
-        "alias": ep.sim.players[index].alias,
-        "turn": turn,
-        "cause": cause,
-        "error": runeCap(errMsg, MaxErrorRunes)
-      })
+      ep.fatalError = "Invalid model plan (slot " & $seatSlot &
+        ", cause=" & cause & "): " & errMsg
+      ep.fatalKind = "player_error"
+      ep.fatalSlot = seatSlot
+      ep.fatalPublicMessage =
+        case cause
+        of "illegal_target": "Player selected a target outside LEGAL TARGETS"
+        of "invalid_action": "Player returned an invalid action"
+        else: "Player returned a malformed plan"
+      ep.finished = true
+      return
 
 proc drainPrivateFinalReply(ep: var Episode) =
   ## Joining can finish a call after the last playing tick. Retain its evidence
@@ -928,6 +956,65 @@ proc websocketHandler(
 proc serverThreadProc(args: ServerThreadArgs) {.thread.} =
   args.server[].serve(Port(args.port), args.address)
 
+proc writePlayerFailure*(kind: string, failedPolicyIndex: int, message: string) =
+  ## Emit the public GamePlayerFailure artifact without exposing provider
+  ## responses or private error details.
+  let failureUri = getEnv(CogamePlayerFailureUriEnv).strip()
+  if failureUri.len == 0:
+    return
+  let safeKind =
+    if kind == "player_error": "player_error"
+    else: "episode_inconclusive"
+  let safeSlot = max(0, failedPolicyIndex)
+  let cleaned = cleanText(message, MaxErrorRunes)
+  let safeMessage =
+    if cleaned.len > 0: cleaned
+    elif safeKind == "player_error": "Player returned an invalid plan"
+    else: "Model service unavailable"
+  let payload = %*{
+    "kind": safeKind,
+    "failed_policy_index": safeSlot,
+    "message": safeMessage
+  }
+  try:
+    writeCogameUri(failureUri, $payload & "\n", "application/json",
+      "player_failure", cogameHttpMethod(CogamePlayerFailureMethodEnv))
+    echo "player failure written to: ", failureUri
+  except CatchableError as error:
+    echo "cooperative-hunting: failed to write COGAME_PLAYER_FAILURE_URI: ",
+      error.msg
+
+proc flushGlobalFrameForFailure(ep: var Episode) =
+  ## Ensure any connected /global viewer receives at least one frame before
+  ## tearing down on a typed player/provider failure, so the runner observes
+  ## player_failure.json rather than a closed /global socket with no message.
+  var globalSockets: seq[WebSocket] = @[]
+  var globalStates: seq[ViewerState] = @[]
+  {.gcsafe.}:
+    withLock appState.lock:
+      for websocket in appState.globalViewers:
+        let st = appState.globalStates.getOrDefault(websocket, ViewerState())
+        if not st.initialized:
+          globalSockets.add(websocket)
+          globalStates.add(st)
+  if globalSockets.len == 0:
+    return
+  let label = ep.currentChromeLabel(nil)
+  var sentAny = false
+  for i in 0 ..< globalSockets.len:
+    var nextState: ViewerState
+    let bytes = ep.sim.buildGlobalFrame(label, globalStates[i], nextState)
+    try:
+      globalSockets[i].send(blobFromBytes(bytes), BinaryMessage)
+      sentAny = true
+      {.gcsafe.}:
+        withLock appState.lock:
+          appState.globalStates[globalSockets[i]] = ViewerState(initialized: true)
+    except CatchableError:
+      discard
+  if sentAny:
+    sleep(200)
+
 proc writeArtifacts(ep: Episode) =
   let results = ep.resultsJson()
   let resultsUri = getEnv(CogameResultsUriEnv)
@@ -1071,14 +1158,20 @@ proc runServerLoop(host: string, port: int, config: GameConfig, selection: Promp
 
   var ep = newEpisode(config, seats, selection)
   ep.llmEnabled = false
+  var firstPromptSlot = -1
   for seat in seats:
     if seat.kind == pkPrompt:
       ep.llmEnabled = true
+      if firstPromptSlot < 0:
+        firstPromptSlot = seat.slot
   if ep.llmEnabled:
     let startupClient = newLlmClient(config)
     if not startupClient.hasLlmCredentials():
       let msg = "FATAL: prompt seat registered but no LLM credentials/endpoint configured"
       echo msg
+      ep.flushGlobalFrameForFailure()
+      writePlayerFailure("episode_inconclusive", firstPromptSlot,
+        "Model endpoint or credentials not configured")
       ep.capture.finishCapture(ep.resultsJson(), msg)
       httpServer.close()
       quit(1)
@@ -1217,6 +1310,7 @@ proc runServerLoop(host: string, port: int, config: GameConfig, selection: Promp
 
   if ep.fatalError.len > 0:
     echo "FATAL: ", ep.fatalError
+    ep.flushGlobalFrameForFailure()
     if llmThreadRunning:
       planRequests.send("quit")
       joinThread(llmThread)
@@ -1224,6 +1318,8 @@ proc runServerLoop(host: string, port: int, config: GameConfig, selection: Promp
       planRequests.close()
       planReplies.close()
       llmThreadRunning = false
+    let failSlot = if ep.fatalSlot >= 0: ep.fatalSlot else: max(0, firstPromptSlot)
+    writePlayerFailure(ep.fatalKind, failSlot, ep.fatalPublicMessage)
     ep.capture.finishCapture(ep.resultsJson(), ep.fatalError)
     httpServer.close()
     quit(1)
